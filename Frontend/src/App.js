@@ -36,6 +36,14 @@ class ErrorBoundary extends React.Component {
   }
 }
 
+// Add error types
+const ErrorTypes = {
+  GEOCODING: 'GEOCODING',
+  ROUTING: 'ROUTING',
+  POI_SEARCH: 'POI_SEARCH',
+  NETWORK: 'NETWORK'
+};
+
 function App() {
   const [location1, setLocation1] = useState('');
   const [location2, setLocation2] = useState('');
@@ -67,6 +75,9 @@ function App() {
 
   // Add this near the top of your component
   const driveTimeCache = new Map();
+
+  // Add caching for geocoding results
+  const geocodeCache = new Map();
 
   // Add validation state
   const [formErrors, setFormErrors] = useState({
@@ -105,9 +116,53 @@ function App() {
     return !errors.location1 && !errors.location2;
   };
 
+  // Add retry logic with exponential backoff
+  const withRetry = async (operation, type, retries = 3) => {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await operation();
+      } catch (error) {
+        console.error(`${type} error (attempt ${i + 1}/${retries}):`, error);
+        
+        if (i === retries - 1) {
+          throw {
+            type,
+            message: getErrorMessage(type, error),
+            originalError: error
+          };
+        }
+        
+        // Exponential backoff
+        await new Promise(resolve => 
+          setTimeout(resolve, Math.min(1000 * Math.pow(2, i), 8000))
+        );
+      }
+    }
+  };
+
+  // Add user-friendly error messages
+  const getErrorMessage = (type, error) => {
+    switch (type) {
+      case ErrorTypes.GEOCODING:
+        return "Couldn't find that location. Please check the address and try again.";
+      case ErrorTypes.ROUTING:
+        return "Couldn't find a route between these locations. Try locations that are closer together.";
+      case ErrorTypes.POI_SEARCH:
+        return "Had trouble finding places in this area. Please try again.";
+      case ErrorTypes.NETWORK:
+        return "Network error. Please check your connection and try again.";
+      default:
+        return error.message || "Something went wrong. Please try again.";
+    }
+  };
+
+  // Update geocodeLocation to use retry logic
   const geocodeLocation = async (location) => {
-    try {
-      console.log('Geocoding location:', location);
+    if (geocodeCache.has(location)) {
+      return geocodeCache.get(location);
+    }
+
+    return withRetry(async () => {
       const response = await axios.get(
         'https://api.openrouteservice.org/geocode/search',
         {
@@ -119,16 +174,14 @@ function App() {
         }
       );
       
-      if (response.data.features && response.data.features.length > 0) {
+      if (response.data.features?.length > 0) {
         const [lng, lat] = response.data.features[0].geometry.coordinates;
-        console.log('Geocoded coordinates:', { lat, lng });
-        return { lat, lng };
+        const result = { lat, lng };
+        geocodeCache.set(location, result);
+        return result;
       }
       throw new Error('Location not found');
-    } catch (error) {
-      console.error('Geocoding error:', error);
-      throw new Error(`Could not find location. Please try a different address.`);
-    }
+    }, ErrorTypes.GEOCODING);
   };
 
   const calculateBestMidpoint = (coordinates) => {
@@ -229,92 +282,197 @@ function App() {
     []
   );
 
+  // Add route caching
+  const routeCache = useMemo(() => new Map(), []);
+
+  // Add cache key generator
+  const generateCacheKey = (point1, point2, type = 'main') => {
+    const locations = [
+      `${point1.lat},${point1.lng}`,
+      `${point2.lat},${point2.lng}`
+    ].sort().join('-');
+    return `${type}-${locations}`;
+  };
+
+  // Update route fetching functions with caching
+  const getRoute = async (point1, point2) => {
+    const cacheKey = generateCacheKey(point1, point2, 'main');
+    
+    if (routeCache.has(cacheKey)) {
+      return routeCache.get(cacheKey);
+    }
+
+    const response = await axios.post(
+      'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
+      {
+        coordinates: [
+          [point1.lng, point1.lat],
+          [point2.lng, point2.lat]
+        ]
+      },
+      {
+        headers: {
+          'Authorization': process.env.REACT_APP_ORS_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    routeCache.set(cacheKey, response.data);
+    return response.data;
+  };
+
+  const getAlternateRoute = async (point1, point2) => {
+    const response = await axios.post(
+      'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
+      {
+        coordinates: [[point1.lng, point1.lat], [point2.lng, point2.lat]],
+        radiuses: [-1],
+        preference: 'shortest',
+        instructions: false,
+        geometry_simplify: false
+      },
+      {
+        headers: {
+          'Authorization': process.env.REACT_APP_ORS_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return response.data;
+  };
+
+  // Add this near other state declarations
+  const [recentSearches, setRecentSearches] = useState(() => {
+    const saved = localStorage.getItem('recentSearches');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  // Update the saveToRecentSearches function
+  const saveToRecentSearches = (loc1, loc2) => {
+    const searchPair = { loc1, loc2, timestamp: Date.now() };
+    
+    setRecentSearches(prev => {
+      // Check if this exact pair already exists
+      const isDuplicate = prev.some(
+        search => 
+          (search.loc1.toLowerCase() === loc1.toLowerCase() && 
+           search.loc2.toLowerCase() === loc2.toLowerCase()) ||
+          (search.loc1.toLowerCase() === loc2.toLowerCase() && 
+           search.loc2.toLowerCase() === loc1.toLowerCase())
+      );
+
+      if (isDuplicate) {
+        // Move the existing pair to the top by removing it and adding new timestamp
+        const filtered = prev.filter(
+          search => 
+            !(search.loc1.toLowerCase() === loc1.toLowerCase() && 
+              search.loc2.toLowerCase() === loc2.toLowerCase()) &&
+            !(search.loc1.toLowerCase() === loc2.toLowerCase() && 
+              search.loc2.toLowerCase() === loc1.toLowerCase())
+        );
+        const newSearches = [searchPair, ...filtered.slice(0, 4)];
+        localStorage.setItem('recentSearches', JSON.stringify(newSearches));
+        return newSearches;
+      }
+
+      // Add new pair if not duplicate
+      const newSearches = [searchPair, ...prev.slice(0, 4)];
+      localStorage.setItem('recentSearches', JSON.stringify(newSearches));
+      return newSearches;
+    });
+  };
+
+  // Add state for showing dropdown
+  const [showRecentSearches, setShowRecentSearches] = useState(false);
+
+  // Add function to remove individual search
+  const removeSearch = (timestamp) => {
+    setRecentSearches(prev => {
+      const newSearches = prev.filter(search => search.timestamp !== timestamp);
+      localStorage.setItem('recentSearches', JSON.stringify(newSearches));
+      return newSearches;
+    });
+  };
+
+  // Add state for second input dropdown
+  const [showRecentSearches1, setShowRecentSearches1] = useState(false);
+  const [showRecentSearches2, setShowRecentSearches2] = useState(false);
+
+  // Add new state for keyboard navigation
+  const [activeIndex, setActiveIndex] = useState(-1);
+
+  // Add keyboard navigation handler
+  const handleKeyDown = (e, searchList, setLocation, closeDropdown) => {
+    switch (e.key) {
+      case 'ArrowDown':
+        e.preventDefault();
+        setActiveIndex(prev => Math.min(prev + 1, searchList.length - 1));
+        break;
+      case 'ArrowUp':
+        e.preventDefault();
+        setActiveIndex(prev => Math.max(prev - 1, -1));
+        break;
+      case 'Enter':
+        if (activeIndex >= 0) {
+          e.preventDefault();
+          setLocation(searchList[activeIndex].loc1);
+          closeDropdown();
+        }
+        break;
+      case 'Escape':
+        closeDropdown();
+        break;
+    }
+  };
+
+  // Update handleSubmit to save searches
   const handleSubmit = async (e) => {
     e.preventDefault();
-    setError(null);
+    if (!validateForm()) return;
     
-    if (!validateForm()) {
-      return;
-    }
-    
+    saveToRecentSearches(location1, location2);
     setIsLoading(true);
-    console.log('Starting handleSubmit with locations:', { location1, location2 });
-    
+    setLoadingPlaces(true);
+    setError(null);
+
     try {
-      // Geocode both locations
-      console.log('Attempting to geocode locations...');
-      const point1 = await geocodeLocation(location1);
-      console.log('Point 1:', point1);
-      const point2 = await geocodeLocation(location2);
-      console.log('Point 2:', point2);
+      // Geocode both locations with retry
+      const [point1, point2] = await Promise.all([
+        geocodeLocation(location1),
+        geocodeLocation(location2)
+      ]);
 
       // Store start points
       setStartPoints([
-        { 
-          name: location1,
-          location: point1,
-          category: 'Start Location'
-        },
-        {
-          name: location2,
-          location: point2,
-          category: 'Start Location'
-        }
+        { name: location1, location: point1, category: 'Start Location' },
+        { name: location2, location: point2, category: 'Start Location' }
       ]);
 
-      // Get main route (fastest route)
-      const mainRouteResponse = await axios.post(
-        'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
-        {
-          coordinates: [
-            [point1.lng, point1.lat],
-            [point2.lng, point2.lat]
-          ]
-        },
-        {
-          headers: {
-            'Authorization': process.env.REACT_APP_ORS_API_KEY,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
-
-      // Get alternate route with different parameters
-      const alternateRouteResponse = await axios.post(
-        'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
-        {
-          coordinates: [[point1.lng, point1.lat], [point2.lng, point2.lat]],
-          radiuses: [-1],
-          preference: 'shortest',
-          instructions: false,
-          geometry_simplify: false
-        },
-        {
-          headers: {
-            'Authorization': process.env.REACT_APP_ORS_API_KEY,
-            'Content-Type': 'application/json'
-          }
-        }
-      );
+      // Get routes with retry
+      const [mainRouteData, alternateRouteData] = await Promise.all([
+        withRetry(() => getRoute(point1, point2), ErrorTypes.ROUTING),
+        withRetry(() => getAlternateRoute(point1, point2), ErrorTypes.ROUTING)
+      ]);
 
       // Process main route
-      const mainCoordinates = mainRouteResponse.data.features[0].geometry.coordinates;
+      const mainCoordinates = mainRouteData.features[0].geometry.coordinates;
       const mainMidpointLocation = calculateBestMidpoint(mainCoordinates);
       const mainRouteLatLngs = mainCoordinates.map(([lng, lat]) => [lat, lng]);
       setRouteCoordinates(mainRouteLatLngs);
       setMidpoint(mainMidpointLocation);
 
       // Process alternate route
-      const alternateCoordinates = alternateRouteResponse.data.features[0].geometry.coordinates;
+      const alternateCoordinates = alternateRouteData.features[0].geometry.coordinates;
       const alternateMidpointLocation = calculateBestMidpoint(alternateCoordinates);
       const alternateRouteLatLngs = alternateCoordinates.map(([lng, lat]) => [lat, lng]);
       setAlternateRouteCoordinates(alternateRouteLatLngs);
       setAlternateMidpoint(alternateMidpointLocation);
 
-      // Get POIs for both midpoints (reduce limit to 5 for each)
+      // Get POIs with retry
       const [mainPOIs, alternatePOIs] = await Promise.all([
-        searchPOIs(mainMidpointLocation, 5, point1, point2),
-        alternateMidpointLocation ? searchPOIs(alternateMidpointLocation, 5, point1, point2) : Promise.resolve([])
+        withRetry(() => searchPOIs(mainMidpointLocation, 5, point1, point2), ErrorTypes.POI_SEARCH),
+        withRetry(() => searchPOIs(alternateMidpointLocation, 5, point1, point2), ErrorTypes.POI_SEARCH)
       ]);
 
       // Combine and set places
@@ -323,23 +481,20 @@ function App() {
         ...alternatePOIs.map(poi => ({ ...poi, route: 'alternate' }))
       ]);
 
-      // Set initial map view to show both routes
+      // Set map bounds
       const allPoints = [
         [point1.lat, point1.lng],
         [point2.lat, point2.lng],
         [mainMidpointLocation.lat, mainMidpointLocation.lng],
-        ...(alternateMidpointLocation ? [[alternateMidpointLocation.lat, alternateMidpointLocation.lng]] : [])
+        [alternateMidpointLocation.lat, alternateMidpointLocation.lng]
       ];
-      
       setMapBounds(calculateBoundsForPoints(allPoints));
       setMapCenter([mainMidpointLocation.lat, mainMidpointLocation.lng]);
+
     } catch (error) {
-      console.error('Detailed error:', error);
-      setError(
-        error.response?.data?.error?.message || 
-        error.message || 
-        'An error occurred while finding the meeting point'
-      );
+      console.error('Error details:', error);
+      setError(getErrorMessage(error.type || ErrorTypes.NETWORK, error));
+      // Clear relevant state
       setStartPoints([]);
       setMidpoint(null);
       setRouteCoordinates(null);
@@ -348,6 +503,7 @@ function App() {
       setPlaces([]);
     } finally {
       setIsLoading(false);
+      setLoadingPlaces(false);
     }
   };
 
@@ -554,6 +710,68 @@ function App() {
     })
   }), []);
 
+  // Add loading skeletons
+  const PlaceSkeleton = () => (
+    <div className="skeleton">
+      <div className="skeleton-text" /> {/* Place name */}
+      <div className="skeleton-text" /> {/* Category */}
+      <div className="skeleton-text" /> {/* Times */}
+      <div className="skeleton-button" /> {/* Button */}
+    </div>
+  );
+
+  // Add this component for recent searches
+  const RecentSearches = ({ onSelect }) => (
+    <div className="recent-searches">
+      <h3>Recent Searches</h3>
+      {recentSearches.map((search, index) => (
+        <button
+          key={index}
+          className="recent-search-item"
+          onClick={() => onSelect(search.loc1, search.loc2)}
+        >
+          <span>{search.loc1}</span>
+          <span className="separator">↔</span>
+          <span>{search.loc2}</span>
+          <span className="timestamp">
+            {new Date(search.timestamp).toLocaleDateString()}
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+
+  // Update click outside handler
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (!event.target.closest('.input-wrapper')) {
+        setShowRecentSearches(false);
+        setShowRecentSearches1(false);
+        setShowRecentSearches2(false);
+      }
+    };
+
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside);
+    };
+  }, []);
+
+  // Add lazy loading for components
+  const PlaceCard = lazy(() => import('./components/PlaceCard'));
+  const RouteDisplay = lazy(() => import('./components/RouteDisplay'));
+
+  // Add loading boundaries
+  const LoadingBoundary = ({ children }) => (
+    <Suspense fallback={
+      <div className="loading-skeleton">
+        <div className="loading-pulse"></div>
+      </div>
+    }>
+      {children}
+    </Suspense>
+  );
+
   return (
     <ErrorBoundary>
       <div className="App">
@@ -568,37 +786,145 @@ function App() {
         
         <form onSubmit={handleSubmit} className="location-form">
           <div className="form-group">
-            <input
-              type="text"
-              value={location1}
-              onChange={(e) => {
-                setLocation1(e.target.value);
-                setFormErrors(prev => ({ ...prev, location1: '' }));
-              }}
-              placeholder="Enter first location"
-              list="saved-locations"
-              disabled={isLoading}
-              className={formErrors.location1 ? 'error' : ''}
-            />
+            <div className="input-wrapper">
+              <label htmlFor="location1" className="visually-hidden">First Location</label>
+              <input
+                id="location1"
+                type="text"
+                value={location1}
+                onChange={(e) => {
+                  setLocation1(e.target.value);
+                  setFormErrors(prev => ({ ...prev, location1: '' }));
+                }}
+                onFocus={() => !isLoading && setShowRecentSearches1(true)}
+                onBlur={() => setTimeout(() => setShowRecentSearches1(false), 200)}
+                onKeyDown={(e) => handleKeyDown(
+                  e,
+                  recentSearches,
+                  setLocation1,
+                  () => setShowRecentSearches1(false)
+                )}
+                placeholder="Enter first location"
+                disabled={isLoading}
+                className={formErrors.location1 ? 'error' : ''}
+                aria-expanded={showRecentSearches1}
+                aria-controls="recent-searches-1"
+                aria-describedby={formErrors.location1 ? 'location1-error' : undefined}
+                role="combobox"
+              />
+              {formErrors.location1 && (
+                <div id="location1-error" className="error-message" role="alert">
+                  {formErrors.location1}
+                </div>
+              )}
+              {showRecentSearches1 && recentSearches.length > 0 && !isLoading && (
+                <div 
+                  id="recent-searches-1"
+                  className="recent-searches-dropdown"
+                  role="listbox"
+                >
+                  {recentSearches.map((search, index) => (
+                    <div
+                      key={search.timestamp}
+                      className={`recent-search-item ${index === activeIndex ? 'active' : ''}`}
+                      role="option"
+                      aria-selected={index === activeIndex}
+                      tabIndex={0}
+                    >
+                      <div 
+                        className="search-text"
+                        onClick={() => setLocation1(search.loc1)}
+                        onKeyPress={(e) => e.key === 'Enter' && setLocation1(search.loc1)}
+                      >
+                        {search.loc1}
+                      </div>
+                      <button
+                        className="delete-search"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          removeSearch(search.timestamp);
+                        }}
+                        aria-label={`Remove ${search.loc1} from history`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
           
           <div className="form-group">
-            <input
-              type="text"
-              value={location2}
-              onChange={(e) => {
-                setLocation2(e.target.value);
-                setFormErrors(prev => ({ ...prev, location2: '' }));
-              }}
-              placeholder="Enter second location"
-              disabled={isLoading}
-              className={formErrors.location2 ? 'error' : ''}
-            />
-            {formErrors.location2 && (
-              <div className="input-error">{formErrors.location2}</div>
-            )}
+            <div className="input-wrapper">
+              <label htmlFor="location2" className="visually-hidden">Second Location</label>
+              <input
+                id="location2"
+                type="text"
+                value={location2}
+                onChange={(e) => {
+                  setLocation2(e.target.value);
+                  setFormErrors(prev => ({ ...prev, location2: '' }));
+                }}
+                onFocus={() => !isLoading && setShowRecentSearches2(true)}
+                onBlur={() => setTimeout(() => setShowRecentSearches2(false), 200)}
+                onKeyDown={(e) => handleKeyDown(
+                  e,
+                  recentSearches,
+                  setLocation2,
+                  () => setShowRecentSearches2(false)
+                )}
+                placeholder="Enter second location"
+                disabled={isLoading}
+                className={formErrors.location2 ? 'error' : ''}
+                aria-expanded={showRecentSearches2}
+                aria-controls="recent-searches-2"
+                aria-describedby={formErrors.location2 ? 'location2-error' : undefined}
+                role="combobox"
+              />
+              {formErrors.location2 && (
+                <div id="location2-error" className="error-message" role="alert">
+                  {formErrors.location2}
+                </div>
+              )}
+              {showRecentSearches2 && recentSearches.length > 0 && !isLoading && (
+                <div 
+                  id="recent-searches-2"
+                  className="recent-searches-dropdown"
+                  role="listbox"
+                >
+                  {recentSearches.map((search, index) => (
+                    <div
+                      key={search.timestamp}
+                      className={`recent-search-item ${index === activeIndex ? 'active' : ''}`}
+                      role="option"
+                      aria-selected={index === activeIndex}
+                      tabIndex={0}
+                    >
+                      <div 
+                        className="search-text"
+                        onClick={() => setLocation2(search.loc2)}
+                        onKeyPress={(e) => e.key === 'Enter' && setLocation2(search.loc2)}
+                      >
+                        {search.loc2}
+                      </div>
+                      <button
+                        className="delete-search"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          removeSearch(search.timestamp);
+                        }}
+                        aria-label={`Remove ${search.loc2} from history`}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
-          
+
           <button type="submit" disabled={isLoading}>
             {isLoading ? 'Calculating...' : 'Find Midpoint'}
           </button>
@@ -636,15 +962,12 @@ function App() {
 
           <div className="places-list">
             {loadingPlaces ? (
-              // Show 3 skeleton cards while loading
-              Array(3).fill(0).map((_, index) => (
-                <div key={index} className="place-card skeleton">
-                  <div className="place-header skeleton" />
-                  <div className="place-times skeleton" />
-                  <div className="view-on-map skeleton" />
-                </div>
-              ))
-            ) : (
+              <>
+                <PlaceSkeleton />
+                <PlaceSkeleton />
+                <PlaceSkeleton />
+              </>
+            ) : filteredPlaces.length > 0 ? (
               filteredPlaces.map((place, index) => (
                 <div key={index} className="place-card">
                   <div className="place-header">
@@ -672,6 +995,10 @@ function App() {
                   </button>
                 </div>
               ))
+            ) : (
+              <div className="no-places">
+                <p>No places found in this area. Try adjusting your search.</p>
+              </div>
             )}
           </div>
         </div>
