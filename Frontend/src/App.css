@@ -164,6 +164,13 @@ button:hover {
   background-color: #f8d7da;
 }
 
+/* Update the loading message animation */
+@keyframes fade-pulse {
+  0% { opacity: 0.6; }
+  50% { opacity: 1; }
+  100% { opacity: 0.6; }
+}
+
 .loading {
   text-align: center;
   padding: 1rem;
@@ -171,6 +178,16 @@ button:hover {
   background-color: #e3f2fd;
   border-radius: 4px;
   color: #1976d2;
+  animation: fade-pulse 1.5s infinite;
+  /* Ensure no sliding animation */
+  transform: none !important;
+  position: static !important;
+  overflow: visible !important;
+}
+
+/* Remove the loading-pulse animation from this element */
+.loading .loading-pulse {
+  display: none;
 }
 
 /* Disable the form while loading */
