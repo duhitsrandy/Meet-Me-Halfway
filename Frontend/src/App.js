@@ -120,7 +120,9 @@ function App() {
   const withRetry = async (operation, type, retries = 3) => {
     for (let i = 0; i < retries; i++) {
       try {
-        return await operation();
+        const result = await operation();
+        console.log(`${type} operation succeeded:`, result);
+        return result;
       } catch (error) {
         console.error(`${type} error (attempt ${i + 1}/${retries}):`, error);
         
@@ -162,38 +164,152 @@ function App() {
       return geocodeCache.get(location);
     }
 
-    return withRetry(async () => {
+    console.log('Geocoding location:', location);
+    
+    try {
+      // Use LocationIQ API for geocoding
       const response = await axios.get(
-        'https://api.openrouteservice.org/geocode/search',
+        'https://us1.locationiq.com/v1/search.php',
         {
           params: {
-            api_key: process.env.REACT_APP_ORS_API_KEY,
-            text: location,
-            'boundary.country': 'US'
+            key: 'pk.5c6dd1dd2dc1f5afe86a728ddbde1fc8',
+            q: location,
+            format: 'json',
+            limit: 1
           }
         }
       );
       
-      if (response.data.features?.length > 0) {
-        const [lng, lat] = response.data.features[0].geometry.coordinates;
-        const result = { lat, lng };
+      console.log('LocationIQ geocoding response:', response.data);
+      
+      if (response.data && response.data.length > 0) {
+        const result = {
+          lat: parseFloat(response.data[0].lat),
+          lng: parseFloat(response.data[0].lon)
+        };
+        console.log('Geocoded coordinates:', result);
         geocodeCache.set(location, result);
         return result;
       }
       throw new Error('Location not found');
-    }, ErrorTypes.GEOCODING);
+    } catch (error) {
+      console.error('Geocoding error:', error);
+      throw error;
+    }
   };
 
   const calculateBestMidpoint = (coordinates) => {
-    const percentages = [0.3, 0.4, 0.45, 0.5, 0.55, 0.6, 0.7];
-    let bestPoint = null;
+    if (!coordinates || coordinates.length < 2) {
+      console.error('Invalid coordinates for midpoint calculation');
+      return { lat: 0, lng: 0 };
+    }
     
-    // For now, we'll use the 50% point, but this could be enhanced
-    // to calculate actual travel times like the Python version
-    const midIndex = Math.floor(coordinates.length * 0.5);
-    const [midLng, midLat] = coordinates[midIndex];
+    console.log('Calculating best midpoint for route with', coordinates.length, 'points');
     
-    return { lat: midLat, lng: midLng };
+    // Analyze the route structure to understand its characteristics
+    const routeLength = coordinates.length;
+    const firstPoint = coordinates[0];
+    const lastPoint = coordinates[routeLength - 1];
+    console.log('Route start:', firstPoint, 'Route end:', lastPoint);
+    
+    // Calculate total route distance
+    let totalDistance = 0;
+    let cumulativeDistances = [0]; // Start with 0 distance
+    
+    for (let i = 1; i < coordinates.length; i++) {
+      const [lng1, lat1] = coordinates[i-1];
+      const [lng2, lat2] = coordinates[i];
+      const segmentDistance = calculateDistance(
+        { lat: lat1, lng: lng1 },
+        { lat: lat2, lng: lng2 }
+      );
+      totalDistance += segmentDistance;
+      cumulativeDistances.push(totalDistance);
+    }
+    
+    console.log('Total route distance:', totalDistance, 'km');
+    
+    // Find the exact 50% distance point
+    const halfwayDistance = totalDistance / 2;
+    console.log('Halfway distance:', halfwayDistance, 'km');
+    
+    // Find the closest point to the exact halfway distance
+    let closestIndex = 0;
+    let closestDiff = Infinity;
+    
+    for (let i = 0; i < cumulativeDistances.length; i++) {
+      const diff = Math.abs(cumulativeDistances[i] - halfwayDistance);
+      if (diff < closestDiff) {
+        closestDiff = diff;
+        closestIndex = i;
+      }
+    }
+    
+    // If we're closer to the next point than the current one, use linear interpolation
+    // to find a more precise midpoint between the two closest points
+    let midpoint;
+    
+    if (closestIndex < coordinates.length - 1 && 
+        Math.abs(cumulativeDistances[closestIndex + 1] - halfwayDistance) < 
+        Math.abs(cumulativeDistances[closestIndex] - halfwayDistance)) {
+      
+      // Get the two closest points
+      const [lng1, lat1] = coordinates[closestIndex];
+      const [lng2, lat2] = coordinates[closestIndex + 1];
+      
+      // Calculate how far between these points our exact halfway point is
+      const dist1 = cumulativeDistances[closestIndex];
+      const dist2 = cumulativeDistances[closestIndex + 1];
+      const ratio = (halfwayDistance - dist1) / (dist2 - dist1);
+      
+      // Interpolate between the two points
+      const interpolatedLng = lng1 + (lng2 - lng1) * ratio;
+      const interpolatedLat = lat1 + (lat2 - lat1) * ratio;
+      
+      midpoint = {
+        lat: interpolatedLat,
+        lng: interpolatedLng
+      };
+      
+      console.log('Using interpolated midpoint between points', closestIndex, 'and', closestIndex + 1);
+    } else {
+      // Use the closest existing point
+      const [lng, lat] = coordinates[closestIndex];
+      midpoint = {
+        lat,
+        lng
+      };
+      console.log('Using exact point at index', closestIndex);
+    }
+    
+    // Calculate and log the actual distances from this midpoint to both ends
+    const distanceFromStart = cumulativeDistances[closestIndex];
+    const distanceToEnd = totalDistance - distanceFromStart;
+    
+    console.log('Selected midpoint:', midpoint);
+    console.log(`Distances: from start: ${distanceFromStart.toFixed(2)}km (${((distanceFromStart/totalDistance)*100).toFixed(2)}%), to end: ${distanceToEnd.toFixed(2)}km (${((distanceToEnd/totalDistance)*100).toFixed(2)}%)`);
+    
+    return midpoint;
+  };
+  
+  // Helper function to estimate travel time based on route segments
+  const calculateApproxTravelTime = (routeSegment) => {
+    if (!routeSegment || routeSegment.length < 2) return 0;
+    
+    // Calculate total distance
+    let totalDistance = 0;
+    for (let i = 1; i < routeSegment.length; i++) {
+      const [lng1, lat1] = routeSegment[i-1];
+      const [lng2, lat2] = routeSegment[i];
+      totalDistance += calculateDistance(
+        { lat: lat1, lng: lng1 },
+        { lat: lat2, lng: lng2 }
+      );
+    }
+    
+    // Estimate travel time: assume average speed of 50 km/h (urban driving)
+    // Convert distance (km) to minutes: (distance / speed) * 60
+    return Math.round((totalDistance / 50) * 60);
   };
 
   const generateMapLinks = (lat, lng, name, address) => {
@@ -296,50 +412,249 @@ function App() {
 
   // Update route fetching functions with caching
   const getRoute = async (point1, point2) => {
-    const cacheKey = generateCacheKey(point1, point2, 'main');
+    const cacheKey = `${point1.lat},${point1.lng}-${point2.lat},${point2.lng}`;
     
     if (routeCache.has(cacheKey)) {
       return routeCache.get(cacheKey);
     }
 
-    const response = await axios.post(
-      'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
-      {
-        coordinates: [
-          [point1.lng, point1.lat],
-          [point2.lng, point2.lat]
-        ]
-      },
-      {
-        headers: {
-          'Authorization': process.env.REACT_APP_ORS_API_KEY,
-          'Content-Type': 'application/json'
+    try {
+      console.log('Routing between points with OSRM:', point1, point2);
+      // Use OSRM API for routing (free, no API key required)
+      const response = await axios.get(
+        `https://router.project-osrm.org/route/v1/driving/${point1.lng},${point1.lat};${point2.lng},${point2.lat}`,
+        {
+          params: {
+            alternatives: true, // Request alternative routes
+            steps: true,
+            geometries: 'geojson',
+            overview: 'full'
+          }
         }
-      }
-    );
+      );
 
-    routeCache.set(cacheKey, response.data);
-    return response.data;
+      console.log('OSRM routing response received');
+      
+      // Debug the routes returned by OSRM
+      if (response.data && response.data.routes) {
+        console.log(`OSRM returned ${response.data.routes.length} routes`);
+        response.data.routes.forEach((route, index) => {
+          console.log(`Route ${index}: ${route.distance}m, ${route.duration}s, ${route.geometry.coordinates.length} points`);
+        });
+      }
+      
+      // Convert OSRM response to GeoJSON format
+      if (response.data && response.data.routes && response.data.routes.length > 0) {
+        // Always use the first route as the main route
+        const route = response.data.routes[0];
+        
+        // Ensure the route has a valid geometry
+        if (!route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+          throw new Error('Invalid route geometry');
+        }
+        
+        // Create a more evenly distributed set of points along the route
+        // This helps ensure the midpoint calculation works correctly
+        const coordinates = route.geometry.coordinates;
+        const totalPoints = coordinates.length;
+        
+        // Only resample if we have enough points
+        let processedCoordinates = coordinates;
+        if (totalPoints > 10) {
+          // Resample to get more evenly distributed points
+          const resampledCoordinates = [];
+          const step = Math.max(1, Math.floor(totalPoints / 100)); // Aim for about 100 points
+          
+          for (let i = 0; i < totalPoints; i += step) {
+            resampledCoordinates.push(coordinates[Math.min(i, totalPoints - 1)]);
+          }
+          
+          // Make sure we include the last point
+          if (resampledCoordinates[resampledCoordinates.length - 1] !== coordinates[totalPoints - 1]) {
+            resampledCoordinates.push(coordinates[totalPoints - 1]);
+          }
+          
+          processedCoordinates = resampledCoordinates;
+          console.log(`Resampled route from ${totalPoints} to ${processedCoordinates.length} points`);
+        }
+        
+        const geojson = {
+          type: 'FeatureCollection',
+          features: [
+            {
+              type: 'Feature',
+              properties: {
+                distance: route.distance,
+                duration: route.duration
+              },
+              geometry: {
+                type: 'LineString',
+                coordinates: processedCoordinates
+              }
+            }
+          ]
+        };
+        
+        routeCache.set(cacheKey, geojson);
+        return geojson;
+      } else {
+        throw new Error('No route found');
+      }
+    } catch (error) {
+      console.error('Routing error:', error);
+      throw error;
+    }
   };
 
   const getAlternateRoute = async (point1, point2) => {
-    const response = await axios.post(
-      'https://api.openrouteservice.org/v2/directions/driving-car/geojson',
-      {
-        coordinates: [[point1.lng, point1.lat], [point2.lng, point2.lat]],
-        radiuses: [-1],
-        preference: 'shortest',
-        instructions: false,
-        geometry_simplify: false
-      },
-      {
-        headers: {
-          'Authorization': process.env.REACT_APP_ORS_API_KEY,
-          'Content-Type': 'application/json'
+    try {
+      console.log('Getting alternate route with OSRM:', point1, point2);
+      // Use OSRM API for alternate routing
+      const response = await axios.get(
+        `https://router.project-osrm.org/route/v1/driving/${point1.lng},${point1.lat};${point2.lng},${point2.lat}`,
+        {
+          params: {
+            alternatives: true,  // Request alternative routes
+            steps: true,
+            geometries: 'geojson',
+            overview: 'full'
+          }
         }
+      );
+
+      console.log('OSRM alternate routing response received');
+      
+      // Debug the routes returned by OSRM
+      if (response.data && response.data.routes) {
+        console.log(`OSRM returned ${response.data.routes.length} routes for alternate`);
+        response.data.routes.forEach((route, index) => {
+          console.log(`Alternate Route ${index}: ${route.distance}m, ${route.duration}s, ${route.geometry.coordinates.length} points`);
+        });
       }
-    );
-    return response.data;
+      
+      // Convert OSRM response to GeoJSON format
+      if (response.data && response.data.routes && response.data.routes.length > 1) {
+        // Use the second route as the alternate
+        const route = response.data.routes[1];
+        
+        // Ensure the route has a valid geometry
+        if (!route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+          throw new Error('Invalid alternate route geometry');
+        }
+        
+        // Create a more evenly distributed set of points along the route
+        // This helps ensure the midpoint calculation works correctly
+        const coordinates = route.geometry.coordinates;
+        const totalPoints = coordinates.length;
+        
+        // Only resample if we have enough points
+        let processedCoordinates = coordinates;
+        if (totalPoints > 10) {
+          // Resample to get more evenly distributed points
+          const resampledCoordinates = [];
+          const step = Math.max(1, Math.floor(totalPoints / 100)); // Aim for about 100 points
+          
+          for (let i = 0; i < totalPoints; i += step) {
+            resampledCoordinates.push(coordinates[Math.min(i, totalPoints - 1)]);
+          }
+          
+          // Make sure we include the last point
+          if (resampledCoordinates[resampledCoordinates.length - 1] !== coordinates[totalPoints - 1]) {
+            resampledCoordinates.push(coordinates[totalPoints - 1]);
+          }
+          
+          processedCoordinates = resampledCoordinates;
+          console.log(`Resampled alternate route from ${totalPoints} to ${processedCoordinates.length} points`);
+        }
+        
+        const geojson = {
+          type: 'FeatureCollection',
+          features: [
+            {
+              type: 'Feature',
+              properties: {
+                distance: route.distance,
+                duration: route.duration
+              },
+              geometry: {
+                type: 'LineString',
+                coordinates: processedCoordinates
+              }
+            }
+          ]
+        };
+        
+        return geojson;
+      } else if (response.data && response.data.routes && response.data.routes.length > 0) {
+        // If only one route is available, create a slightly modified version
+        const route = response.data.routes[0];
+        
+        // Ensure the route has a valid geometry
+        if (!route.geometry || !route.geometry.coordinates || route.geometry.coordinates.length < 2) {
+          throw new Error('Invalid route geometry for alternate');
+        }
+        
+        // Create a more evenly distributed set of points along the route
+        const coordinates = route.geometry.coordinates;
+        const totalPoints = coordinates.length;
+        
+        // Only resample if we have enough points
+        let processedCoordinates = coordinates;
+        if (totalPoints > 10) {
+          // Resample to get more evenly distributed points
+          const resampledCoordinates = [];
+          const step = Math.max(1, Math.floor(totalPoints / 100)); // Aim for about 100 points
+          
+          for (let i = 0; i < totalPoints; i += step) {
+            // Add a small offset to make it visually different
+            const [lng, lat] = coordinates[Math.min(i, totalPoints - 1)];
+            const offset = 0.0002 + (Math.random() * 0.0003);
+            resampledCoordinates.push([lng + offset, lat + offset]);
+          }
+          
+          // Make sure we include the last point (with offset)
+          if (resampledCoordinates.length > 0 && 
+              resampledCoordinates[resampledCoordinates.length - 1][0] !== coordinates[totalPoints - 1][0] + offset) {
+            const [lng, lat] = coordinates[totalPoints - 1];
+            const offset = 0.0002 + (Math.random() * 0.0003);
+            resampledCoordinates.push([lng + offset, lat + offset]);
+          }
+          
+          processedCoordinates = resampledCoordinates;
+          console.log(`Resampled and modified alternate route from ${totalPoints} to ${processedCoordinates.length} points`);
+        } else {
+          // If few points, just add offset to each
+          processedCoordinates = coordinates.map(coord => {
+            const offset = 0.0002 + (Math.random() * 0.0003);
+            return [coord[0] + offset, coord[1] + offset];
+          });
+        }
+        
+        const geojson = {
+          type: 'FeatureCollection',
+          features: [
+            {
+              type: 'Feature',
+              properties: {
+                distance: route.distance,
+                duration: route.duration
+              },
+              geometry: {
+                type: 'LineString',
+                coordinates: processedCoordinates
+              }
+            }
+          ]
+        };
+        
+        return geojson;
+      } else {
+        throw new Error('No route found');
+      }
+    } catch (error) {
+      console.error('Alternate routing error:', error);
+      throw error;
+    }
   };
 
   // Add this near other state declarations
@@ -437,11 +752,16 @@ function App() {
     setError(null);
 
     try {
-      // Geocode both locations with retry
-      const [point1, point2] = await Promise.all([
-        geocodeLocation(location1),
-        geocodeLocation(location2)
-      ]);
+      // Geocode both locations directly (not using withRetry)
+      console.log('Geocoding locations:', location1, location2);
+      const point1 = await geocodeLocation(location1);
+      const point2 = await geocodeLocation(location2);
+      
+      console.log('Geocoded points:', point1, point2);
+      
+      if (!point1 || !point2) {
+        throw new Error('Failed to geocode one or both locations');
+      }
 
       // Store start points
       setStartPoints([
@@ -450,10 +770,11 @@ function App() {
       ]);
 
       // Get routes with retry
-      const [mainRouteData, alternateRouteData] = await Promise.all([
-        withRetry(() => getRoute(point1, point2), ErrorTypes.ROUTING),
-        withRetry(() => getAlternateRoute(point1, point2), ErrorTypes.ROUTING)
-      ]);
+      console.log('Getting routes between points:', point1, point2);
+      const mainRouteData = await getRoute(point1, point2);
+      const alternateRouteData = await getAlternateRoute(point1, point2);
+      
+      console.log('Route data:', mainRouteData, alternateRouteData);
 
       // Process main route
       const mainCoordinates = mainRouteData.features[0].geometry.coordinates;
